@@ -1,0 +1,11 @@
+# Trạng thái Vagrant, chứa cả private key nó sinh ra
+.vagrant/
+
+# Do ansible-galaxy cài từ requirements.yml
+roles/
+collections/
+
+*.retry
+*.pem
+kubeconfig*
+admin.conf

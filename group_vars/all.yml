@@ -1,0 +1,5 @@
+---
+# Interface carrying the 192.168.56.x private network. Flannel (--iface) and the
+# kubelet (--node-ip) must both use it in Part 2: enp0s3 is VirtualBox NAT and
+# has the same 10.0.2.15 address on every VM.
+k8s_iface: enp0s8

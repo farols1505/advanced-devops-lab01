@@ -1,0 +1,22 @@
+---
+# Install with: ansible-galaxy install -r requirements.yml
+# Versions are pinned so a rebuild from scratch uses exactly the same code.
+# Collections must be pinned: Ubuntu's apt "ansible" package already bundles
+# older copies (e.g. kubernetes.core 2.4.0), and without a version Galaxy
+# treats those as installed and puts nothing in ./collections.
+
+roles:
+  - name: geerlingguy.containerd   # container runtime (systemd cgroup driver)
+    version: 1.4.1
+  - name: geerlingguy.kubernetes   # kubeadm/kubelet/kubectl, init + join
+    version: 8.2.0
+  - name: geerlingguy.helm         # Helm 3 binary on the control plane
+    version: 1.0.1
+
+collections:
+  - name: kubernetes.core          # kubernetes.core.helm / k8s modules (Part 3)
+    version: 6.6.0                 # latest supporting ansible-core 2.16
+  - name: ansible.posix            # sysctl (ip_forward)
+    version: 2.2.2
+  - name: community.general        # modprobe (overlay, br_netfilter)
+    version: 11.4.9                # 12.x+ needs ansible-core >= 2.17
