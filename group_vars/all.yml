@@ -1,5 +1,13 @@
 ---
-# Interface carrying the 192.168.56.x private network. Flannel (--iface) and the
-# kubelet (--node-ip) must both use it in Part 2: enp0s3 is VirtualBox NAT and
-# has the same 10.0.2.15 address on every VM.
-k8s_iface: enp0s8
+# Interface carrying the 192.168.56.x private network. The bento box disables
+# predictable names, so it is eth1 (the PDF's enp0s8); eth0 (the PDF's enp0s3)
+# is VirtualBox NAT and has the same 10.0.2.15 address on every VM.
+k8s_iface: eth1
+
+# This node's address on that interface, read from the gathered facts.
+k8s_node_ip: "{{ ansible_facts[k8s_iface]['ipv4']['address'] }}"
+
+# The two Vagrant networking traps. Both must stay true for a working cluster;
+# set one to false only for the Part 2 network experiments.
+flannel_pin_iface: true      # trap 1: Flannel --iface
+kubelet_pin_node_ip: true    # trap 2: kubelet --node-ip

@@ -1,0 +1,27 @@
+---
+# --- geerlingguy.containerd ---
+# Pinned to 1.7: Docker's repo now ships containerd 2.x, whose config.toml
+# (version 3) the role's SystemdCgroup patch does not match.
+containerd_package: containerd.io=1.7.29-1~ubuntu.22.04~jammy
+containerd_config_cgroup_driver_systemd: true
+
+# --- geerlingguy.kubernetes ---
+kubernetes_version: '1.33'
+# Default is ansible_default_ipv4 = the NAT address 10.0.2.15, which node1
+# would then try to join (and reach itself).
+kubernetes_apiserver_advertise_address: "{{ k8s_node_ip }}"
+kubernetes_pod_network:
+  cni: flannel
+  cidr: '10.244.0.0/16'
+# Our patched copy on the master, not the upstream URL (see cluster.yml).
+kubernetes_flannel_manifest_file: "{{ flannel_manifest_path }}"
+# Keep application pods off the 2 GB control plane.
+kubernetes_allow_pods_on_control_plane: false
+
+# --- Flannel ---
+flannel_version: v0.28.10
+flannel_manifest_url: "https://github.com/flannel-io/flannel/releases/download/{{ flannel_version }}/kube-flannel.yml"
+flannel_manifest_path: "/opt/flannel/kube-flannel-{{ flannel_version }}.yml"
+
+# --- geerlingguy.helm ---
+helm_version: v3.22.0

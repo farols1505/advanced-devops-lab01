@@ -1,0 +1,161 @@
+---
+# Part 2: build a two-node kubeadm cluster on the Vagrant VMs.
+#   ansible-playbook playbooks/cluster.yml
+# Settings live in group_vars/ (all.yml, k8s.yml, control_plane.yml, workers.yml).
+
+- name: Prepare the nodes and build the cluster
+  hosts: k8s
+  become: true
+  # The nodes depend on each other (node1 joins using a command produced on
+  # the master), so one failed host must stop the whole play.
+  any_errors_fatal: true
+
+  pre_tasks:
+    # The kubelet refuses to start while swap is on; the bento box has /swap.img.
+    - name: Turn swap off now
+      ansible.builtin.command: swapoff -a
+      when: ansible_facts['swaptotal_mb'] > 0
+      tags: [prepare]
+
+    - name: Keep swap off after a reboot (comment out swap lines in fstab)
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+      tags: [prepare]
+
+    # containerd needs overlayfs; br_netfilter lets iptables see bridged pod traffic.
+    - name: Load kernel modules now and at boot
+      community.general.modprobe:
+        name: "{{ item }}"
+        persistent: present
+      loop: [overlay, br_netfilter]
+      tags: [prepare]
+
+    # Without forwarding the kernel drops pod traffic between nodes.
+    - name: Enable IP forwarding
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+        reload: true
+      tags: [prepare]
+
+    # Trap 1. Flannel picks the interface of the default route, eth0 (NAT),
+    # whose 10.0.2.15 is identical on both VMs, so VXLAN traffic between nodes
+    # goes nowhere. Pin it to the private network instead.
+    - name: Create a directory for the Flannel manifest
+      ansible.builtin.file:
+        path: "{{ flannel_manifest_path | dirname }}"
+        state: directory
+        mode: '0755'
+      when: kubernetes_role == 'control_plane'
+      tags: [prepare, flannel]
+
+    - name: Download the Flannel manifest
+      ansible.builtin.get_url:
+        url: "{{ flannel_manifest_url }}"
+        dest: "{{ flannel_manifest_path }}"
+        mode: '0644'
+      when: kubernetes_role == 'control_plane'
+      tags: [prepare, flannel]
+
+    - name: Patch Flannel to use the private-network interface
+      ansible.builtin.lineinfile:
+        path: "{{ flannel_manifest_path }}"
+        regexp: '^\s*- --iface='
+        line: "        - --iface={{ k8s_iface }}"
+        insertafter: '^\s*- --kube-subnet-mgr$'
+        state: "{{ 'present' if flannel_pin_iface | bool else 'absent' }}"
+      when: kubernetes_role == 'control_plane'
+      tags: [prepare, flannel]
+
+    # Trap 2. The kubelet registers the address of the default route too, so
+    # the API server would call 10.0.2.15:10250 (itself) for logs/exec on node1.
+    # /etc/default/kubelet is read by the kubeadm systemd drop-in.
+    - name: Pin the kubelet node IP to the private network
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: "KUBELET_EXTRA_ARGS={{ ('--node-ip=' ~ k8s_node_ip) if kubelet_pin_node_ip | bool else '' }}\n"
+        mode: '0644'
+      register: kubelet_node_ip_file
+      tags: [prepare, kubelet]
+
+    # geerlingguy.kubernetes installs kubelet, kubectl and kubeadm one at a
+    # time. The kubelet starts before kubeadm brings its systemd drop-in, runs
+    # in standalone mode and holds port 10250, so `kubeadm join` fails its
+    # preflight check. Keep it stopped until kubeadm has written its config;
+    # kubeadm init/join then reload systemd and start it themselves.
+    - name: Create the kubelet systemd drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+      tags: [prepare, kubelet]
+
+    - name: Do not start the kubelet before kubeadm has configured it
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service.d/05-wait-for-kubeadm.conf
+        content: |
+          [Unit]
+          ConditionPathExists=/var/lib/kubelet/config.yaml
+        mode: '0644'
+      register: kubelet_wait_dropin
+      tags: [prepare, kubelet]
+
+    - name: Reload systemd after adding the drop-in
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: kubelet_wait_dropin is changed
+      tags: [prepare, kubelet]
+
+  roles:
+    - role: geerlingguy.containerd
+      tags: [containerd]
+    - role: geerlingguy.kubernetes
+      tags: [kubernetes]
+
+  post_tasks:
+    # Only needed when the file changes on an existing cluster (e.g. the
+    # network experiment); on a fresh build the kubelet already read it.
+    - name: Restart the kubelet if its node IP setting changed
+      ansible.builtin.systemd_service:
+        name: kubelet
+        state: restarted
+      when: kubelet_node_ip_file is changed
+      tags: [kubelet]
+
+- name: Install Helm on the control plane
+  hosts: control_plane
+  become: true
+  roles:
+    - role: geerlingguy.helm
+      tags: [helm]
+
+- name: Wait until the cluster is Ready
+  hosts: control_plane
+  become: true
+  tags: [wait]
+  tasks:
+    - name: Wait for every node to register and report Ready
+      ansible.builtin.command: >-
+        kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+      register: node_ready
+      until: node_ready.stdout_lines | select('equalto', 'True') | list | length == groups['k8s'] | length
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Wait for the kube-system and kube-flannel pods
+      ansible.builtin.command: kubectl wait pods --all -n {{ item }} --for=condition=Ready --timeout=300s
+      loop: [kube-system, kube-flannel]
+      changed_when: false
+
+    - name: Get the nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: nodes
+      changed_when: false
+
+    - name: Show the nodes
+      ansible.builtin.debug:
+        var: nodes.stdout_lines

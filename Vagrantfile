@@ -28,8 +28,8 @@ Vagrant.configure("2") do |config|
 
     config.vm.define name do |node|
       node.vm.hostname = name
-      # enp0s3 = VirtualBox NAT (same 10.0.2.15 on every VM, used by `vagrant ssh`)
-      # enp0s8 = this private network, the only one the VMs can reach each other on
+      # eth0 = VirtualBox NAT (same 10.0.2.15 on every VM, used by `vagrant ssh`)
+      # eth1 = this private network, the only one the VMs can reach each other on
       node.vm.network "private_network", ip: spec[:ip]
 
       node.vm.provider "virtualbox" do |vb|
