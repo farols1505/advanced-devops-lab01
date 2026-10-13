@@ -1,0 +1,5 @@
+---
+# Everything after `vagrant up`, in order:
+#   ansible-playbook site.yml
+- import_playbook: playbooks/cluster.yml
+- import_playbook: playbooks/app.yml

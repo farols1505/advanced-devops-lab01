@@ -1,0 +1,57 @@
+---
+# Part 3: deploy the Online Boutique onto the cluster with Helm, from Ansible.
+#   ansible-playbook playbooks/app.yml
+# Releases and overrides live in vars/microservices.yml.
+
+- name: Deploy the Online Boutique
+  hosts: control_plane
+  become: true
+  vars_files:
+    - ../vars/microservices.yml
+
+  tasks:
+    # Without helm-diff, kubernetes.core.helm compares the release's values
+    # with the values files only, ignores our `values` overrides, and reports
+    # every release as changed on every run.
+    - name: Install the helm-diff plugin
+      kubernetes.core.helm_plugin:
+        plugin_path: https://github.com/databus23/helm-diff
+        plugin_version: "{{ helm_diff_version }}"
+        state: present
+
+    - name: Clone the upstream charts at a pinned commit
+      ansible.builtin.git:
+        repo: "{{ microservice_repo }}"
+        dest: "{{ src }}"
+        version: "{{ microservice_repo_version }}"
+
+    - name: Deploy each microservice as a Helm release
+      kubernetes.core.helm:
+        name: "{{ item.name }}"
+        chart_ref: "{{ src }}/{{ item.chart }}"
+        release_namespace: "{{ app_namespace }}"
+        create_namespace: true
+        values_files:
+          - "{{ src }}/{{ item.values_file }}"    # upstream file, unchanged
+        values: "{{ common | combine(item.overrides | default({})) }}"  # ours, applied last
+      loop: "{{ microservices }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for every Deployment to become Available
+      ansible.builtin.command: >-
+        kubectl -n {{ app_namespace }} wait deployment --all
+        --for=condition=Available --timeout=600s
+      changed_when: false
+
+    - name: Read the frontend NodePort
+      ansible.builtin.command: >-
+        kubectl -n {{ app_namespace }} get service frontend
+        -o jsonpath={.spec.ports[0].nodePort}
+      register: frontend_node_port
+      changed_when: false
+
+    # A NodePort is published on every node; node1 is where the pods run.
+    - name: Show the storefront URL
+      ansible.builtin.debug:
+        msg: "Storefront: http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ frontend_node_port.stdout }}/"

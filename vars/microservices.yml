@@ -1,0 +1,71 @@
+---
+# Online Boutique: eleven Helm releases built from two upstream charts.
+# The upstream repository is never edited. Each release takes the upstream
+# values file unchanged, then `common` and its own `overrides` on top, which
+# Helm applies last, so they win:
+#   values_files: [ "{{ src }}/{{ item.values_file }}" ]
+#   values:       "{{ common | combine(item.overrides | default({})) }}"
+
+microservice_repo: https://github.com/iankisali/microservice-deployment.git
+# Pinned commit, so a rebuild deploys exactly what was tested.
+microservice_repo_version: 8ed96c8d98625c73b67c7172b6703383ea9e46e9
+src: /opt/microservice-deployment
+
+app_namespace: microservice
+
+# helm-diff gives kubernetes.core.helm an accurate idempotency check.
+helm_diff_version: v3.15.15
+
+# Upstream asks for two replicas of everything (over twenty pods, sized for
+# EKS). One 4 GB worker cannot run that; one replica each still exercises the
+# full architecture. For redis-cart it also keeps the cart in one place: two
+# replicas would each have their own emptyDir behind one Service.
+common:
+  appReplicas: 1
+
+# Set to false only to reproduce the upstream checkoutservice bug.
+fix_checkout_bug: true
+
+microservices:
+  - name: rediscart
+    chart: chart/redis
+    values_file: values/redis-values.yaml
+  - name: emailservice
+    chart: chart/microservice
+    values_file: values/email-service-values.yaml
+  - name: cartservice
+    chart: chart/microservice
+    values_file: values/cart-service-values.yaml
+  - name: currencyservice
+    chart: chart/microservice
+    values_file: values/currency-service-values.yaml
+  - name: paymentservice
+    chart: chart/microservice
+    values_file: values/payment-service-values.yaml
+  - name: recommendationservice
+    chart: chart/microservice
+    values_file: values/recommendation-service-values.yaml
+  - name: productcatalogservice
+    chart: chart/microservice
+    values_file: values/productcatalog-service-values.yaml
+  - name: shippingservice
+    chart: chart/microservice
+    values_file: values/shipping-service-values.yaml
+  - name: adservice
+    chart: chart/microservice
+    values_file: values/ad-service-values.yaml
+  - name: checkoutservice
+    chart: chart/microservice
+    values_file: values/checkout-service-values.yaml
+    # Upstream bug: the file says `appImage: checkoutservice` where it means
+    # appName. The duplicate key loses, appName is never set and the chart
+    # default "servicename" names the Deployment and Service, while the
+    # frontend calls checkoutservice:5050.
+    overrides: "{{ {'appName': 'checkoutservice'} if fix_checkout_bug | bool else {} }}"
+  - name: frontendservice
+    chart: chart/microservice
+    values_file: values/frontend-values.yaml
+    # Upstream asks for a LoadBalancer. Nothing provisions one on bare-metal
+    # kubeadm, so it would stay <pending> forever.
+    overrides:
+      serviceType: NodePort
