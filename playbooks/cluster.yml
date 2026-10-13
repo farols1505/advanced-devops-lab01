@@ -146,9 +146,26 @@
       delay: 10
       changed_when: false
 
+    # After a manifest change (e.g. Flannel's --iface) a DaemonSet replaces its
+    # pods one by one. `kubectl wait --all` lists the pods when it starts, so a
+    # pod deleted mid-rollout fails it with NotFound. Wait for rollouts first.
+    - name: Wait for Flannel, kube-proxy and CoreDNS to finish rolling out
+      ansible.builtin.command: kubectl -n {{ item.namespace }} rollout status {{ item.workload }} --timeout=300s
+      loop:
+        - { namespace: kube-flannel, workload: daemonset/kube-flannel-ds }
+        - { namespace: kube-system, workload: daemonset/kube-proxy }
+        - { namespace: kube-system, workload: deployment/coredns }
+      loop_control:
+        label: "{{ item.workload }}"
+      changed_when: false
+
     - name: Wait for the kube-system and kube-flannel pods
       ansible.builtin.command: kubectl wait pods --all -n {{ item }} --for=condition=Ready --timeout=300s
       loop: [kube-system, kube-flannel]
+      register: pods_ready
+      until: pods_ready is succeeded
+      retries: 3
+      delay: 10
       changed_when: false
 
     - name: Get the nodes
