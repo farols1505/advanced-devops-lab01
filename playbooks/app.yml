@@ -34,6 +34,11 @@
         values_files:
           - "{{ src }}/{{ item.values_file }}"    # upstream file, unchanged
         values: "{{ common | combine(item.overrides | default({})) }}"  # ours, applied last
+        # helm-diff compares the chart with the release record, not with the
+        # live cluster, so a resource deleted by hand goes unnoticed (ok,
+        # changed=0). -e app_force_upgrade=true runs `helm upgrade --force` for
+        # every release, which recreates it (and restarts the pods).
+        force: "{{ app_force_upgrade | default(false) | bool }}"
       loop: "{{ microservices }}"
       loop_control:
         label: "{{ item.name }}"
