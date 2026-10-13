@@ -1,0 +1,262 @@
+---
+# Part 4: prove that the deployment works. Every check is an assertion, so
+# any failure stops the play.
+#   ansible-playbook playbooks/verify.yml
+#
+# The expectations come from the project brief (Appendix A), not from
+# vars/microservices.yml, so a mistake in our own deploy vars is caught too.
+
+- name: Verify the cluster and the Online Boutique
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  vars:
+    app_namespace: microservice
+    # Appendix A: every Service and its port. In this chart the Deployment
+    # has the same name as its Service.
+    expected_services:
+      frontend: 80
+      productcatalogservice: 3550
+      currencyservice: 7000
+      cartservice: 7070
+      recommendationservice: 8080
+      shippingservice: 50051
+      checkoutservice: 5050
+      adservice: 9555
+      paymentservice: 50051
+      emailservice: 5000
+      redis-cart: 6379
+    test_product_id: OLJCESPC7Z
+    test_order:
+      email: someone@example.com
+      street_address: 1600 Amphitheatre Parkway
+      zip_code: '94043'
+      city: Mountain View
+      state: CA
+      country: United States
+      credit_card_number: '4432801561520454'
+      credit_card_expiration_month: '1'
+      credit_card_expiration_year: '2030'
+      credit_card_cvv: '672'
+
+  tasks:
+    # --- Nodes ---------------------------------------------------------------
+    - name: Get the nodes
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: nodes
+
+    - name: The cluster has exactly the nodes in the inventory
+      ansible.builtin.assert:
+        that:
+          - nodes.resources | map(attribute='metadata.name') | sort == groups['k8s'] | sort
+        fail_msg: "Nodes {{ nodes.resources | map(attribute='metadata.name') | list }}, inventory {{ groups['k8s'] }}"
+        success_msg: "Nodes: {{ groups['k8s'] | join(', ') }}"
+
+    - name: Every node is Ready and registered on the private network
+      ansible.builtin.assert:
+        that:
+          - this_node_ready | string == 'True'    # "True" would otherwise be templated to a boolean
+          - this_node_ip == hostvars[item]['ansible_host']
+        fail_msg: "{{ item }}: Ready={{ this_node_ready }}, InternalIP={{ this_node_ip }} (expected {{ hostvars[item]['ansible_host'] }})"
+        success_msg: "{{ item }}: Ready, InternalIP {{ this_node_ip }}"
+      loop: "{{ groups['k8s'] }}"
+      # Names are prefixed with this_: in site.yml, cluster.yml has already
+      # registered `node_ready`, and registered vars override task vars.
+      vars:
+        this_node: "{{ nodes.resources | selectattr('metadata.name', 'equalto', item) | first }}"
+        this_node_ready: "{{ this_node.status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('missing') }}"
+        this_node_ip: "{{ this_node.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first | default('missing') }}"
+
+    # --- Deployments ---------------------------------------------------------
+    - name: Get the Deployments
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ app_namespace }}"
+      register: deployments
+
+    # Catches the upstream bug: it shows up as a "servicename" Deployment and
+    # a missing "checkoutservice".
+    - name: Exactly the eleven expected Deployments exist
+      ansible.builtin.assert:
+        that:
+          - deployment_names | sort == expected_services.keys() | sort
+        fail_msg: >-
+          Missing: {{ expected_services.keys() | difference(deployment_names) }},
+          unexpected: {{ deployment_names | difference(expected_services.keys()) }}
+        success_msg: "{{ deployment_names | length }} Deployments, names as expected"
+      vars:
+        deployment_names: "{{ deployments.resources | map(attribute='metadata.name') | list }}"
+
+    - name: Every Deployment has all its replicas available
+      ansible.builtin.assert:
+        that:
+          - item.spec.replicas >= 1
+          - (item.status.availableReplicas | default(0)) == item.spec.replicas
+        fail_msg: "{{ item.metadata.name }}: {{ item.status.availableReplicas | default(0) }}/{{ item.spec.replicas }} available"
+        success_msg: "{{ item.metadata.name }}: {{ item.status.availableReplicas }}/{{ item.spec.replicas }} available"
+      loop: "{{ deployments.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    # --- Services ------------------------------------------------------------
+    - name: Get the Services
+      kubernetes.core.k8s_info:
+        kind: Service
+        namespace: "{{ app_namespace }}"
+      register: services
+
+    - name: Every Service from Appendix A exists with the right port
+      ansible.builtin.assert:
+        that:
+          - svc | length > 0
+          - item.value in svc.spec.ports | map(attribute='port') | list
+        fail_msg: "Service {{ item.key }}:{{ item.value }} is missing or has the wrong port"
+        success_msg: "Service {{ item.key }}:{{ item.value }}"
+      loop: "{{ expected_services | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      vars:
+        svc: "{{ services.resources | selectattr('metadata.name', 'equalto', item.key) | first | default({}) }}"
+
+    - name: Get the endpoints of checkoutservice
+      kubernetes.core.k8s_info:
+        api_version: discovery.k8s.io/v1
+        kind: EndpointSlice
+        namespace: "{{ app_namespace }}"
+        label_selectors:
+          - kubernetes.io/service-name=checkoutservice
+      register: checkout_endpoints
+
+    - name: checkoutservice exists under its real name and is backed by a ready pod
+      ansible.builtin.assert:
+        that:
+          - ready_endpoints | int >= 1
+        fail_msg: "checkoutservice has no ready endpoints"
+        success_msg: "checkoutservice has {{ ready_endpoints }} ready endpoint(s)"
+      vars:
+        ready_endpoints: >-
+          {{ checkout_endpoints.resources | map(attribute='endpoints') | map('default', [], true)
+             | flatten | selectattr('conditions.ready') | list | length }}
+
+    # The general form of the checkout bug: a caller configured with a
+    # Service name that does not exist. Check every *_ADDR of every Deployment.
+    - name: Collect the addresses every Deployment calls and the ports every Service publishes
+      ansible.builtin.set_fact:
+        service_addresses: >-
+          {%- set out = [] -%}
+          {%- for d in deployments.resources -%}
+          {%- for c in d.spec.template.spec.containers -%}
+          {%- for e in c.env | default([]) if e.name is match('.*_ADDR$') -%}
+          {%- set _ = out.append({'caller': d.metadata.name, 'name': e.name, 'value': e.value}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+        service_ports: >-
+          {%- set out = {} -%}
+          {%- for s in services.resources -%}
+          {%- set _ = out.update({s.metadata.name: s.spec.ports | map(attribute='port') | list}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Every service address a Deployment calls exists
+      ansible.builtin.assert:
+        that:
+          - target_name in service_ports
+          - target_port | int in service_ports[target_name]
+        fail_msg: "{{ item.caller }}: {{ item.name }}={{ item.value }}, but no Service {{ target_name }} publishes port {{ target_port }}"
+        success_msg: "{{ item.caller }}: {{ item.name }}={{ item.value }}"
+      loop: "{{ service_addresses }}"
+      loop_control:
+        label: "{{ item.caller }} {{ item.name }}"
+      vars:
+        target_name: "{{ item.value.split(':')[0] }}"
+        target_port: "{{ item.value.split(':')[1] }}"
+
+    - name: The frontend Service is a NodePort
+      ansible.builtin.assert:
+        that:
+          - frontend_svc.spec.type == 'NodePort'
+          - frontend_svc.spec.ports[0].nodePort is defined
+        fail_msg: "frontend is a {{ frontend_svc.spec.type }}, expected NodePort"
+        success_msg: "frontend is a NodePort on port {{ frontend_svc.spec.ports[0].nodePort }}"
+      vars:
+        frontend_svc: "{{ services.resources | selectattr('metadata.name', 'equalto', 'frontend') | first }}"
+
+    - name: Remember the storefront URL
+      ansible.builtin.set_fact:
+        frontend_node_port: "{{ (services.resources | selectattr('metadata.name', 'equalto', 'frontend') | first).spec.ports[0].nodePort }}"
+        storefront_url: "http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ (services.resources | selectattr('metadata.name', 'equalto', 'frontend') | first).spec.ports[0].nodePort }}/"
+
+    # --- HTTP ----------------------------------------------------------------
+    # A NodePort is published on every node. Going through the master also
+    # crosses the Flannel tunnel to the frontend pod on node1.
+    - name: The storefront returns 200 with recognisable content on every node
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[item]['ansible_host'] }}:{{ frontend_node_port }}/"
+        return_content: true
+        timeout: 30
+      register: storefront
+      failed_when: storefront.status != 200 or 'Online Boutique' not in storefront.content
+      loop: "{{ groups['k8s'] }}"
+
+    # A real purchase: frontend -> cart (redis) -> checkout -> payment,
+    # shipping, email, currency, productcatalog. This is the path the
+    # upstream bug breaks while every page still loads.
+    - name: Open a shopping session
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}"
+        timeout: 30
+      register: session
+
+    - name: Add a product to the cart
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}cart"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          product_id: "{{ test_product_id }}"
+          quantity: 1
+        headers:
+          Cookie: "{{ session.cookies_string }}"
+        follow_redirects: none
+        status_code: 302
+        timeout: 30
+
+    # Right after checkoutservice is (re)created, the frontend's gRPC client
+    # may still be backing off from its earlier failed attempts and fail the
+    # first order for a few seconds. Retry briefly; a real naming bug fails
+    # every attempt. A failed checkout leaves the item in the cart.
+    - name: Place an order
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}cart/checkout"
+        method: POST
+        body_format: form-urlencoded
+        body: "{{ test_order }}"
+        headers:
+          Cookie: "{{ session.cookies_string }}"
+        return_content: true
+        status_code: [200, 500]
+        timeout: 30
+      register: order
+      until: order.status == 200
+      retries: 5
+      delay: 10
+
+    - name: The order is complete
+      ansible.builtin.assert:
+        that:
+          - order.status == 200
+          - "'Your order is complete' in order.content"
+        fail_msg: "Checkout failed with HTTP {{ order.status }}"
+        success_msg: "Order {{ order_id }} placed"
+      vars:
+        order_id: "{{ order.content | default('') | regex_findall('Order Confirmation ID</p>[^<]*<p[^>]*><strong>([^<]+)') | first | default('?') }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "All checks passed."
+          - "Storefront: {{ storefront_url }}"

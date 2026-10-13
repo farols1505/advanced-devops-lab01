@@ -125,12 +125,27 @@
       when: kubelet_node_ip_file is changed
       tags: [kubelet]
 
-- name: Install Helm on the control plane
+- name: Install Helm and the Kubernetes Python client on the control plane
   hosts: control_plane
   become: true
   roles:
     - role: geerlingguy.helm
       tags: [helm]
+
+  tasks:
+    # kubernetes.core.k8s_info (used by verify.yml) runs on the master and
+    # needs this library. Ubuntu 22.04's python3-kubernetes is 12.0.1, too old
+    # for kubernetes.core 6.x (>= 24.2.0), so install it from PyPI.
+    - name: Install pip
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+      tags: [k8s-client]
+
+    - name: Install the Kubernetes Python client
+      ansible.builtin.pip:
+        name: "kubernetes=={{ kubernetes_python_client_version }}"
+      tags: [k8s-client]
 
 - name: Wait until the cluster is Ready
   hosts: control_plane

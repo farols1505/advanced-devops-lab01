@@ -3,3 +3,4 @@
 #   ansible-playbook site.yml
 - import_playbook: playbooks/cluster.yml
 - import_playbook: playbooks/app.yml
+- import_playbook: playbooks/verify.yml
