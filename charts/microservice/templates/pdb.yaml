@@ -1,0 +1,16 @@
+{{- /* Lab01 extension: PodDisruptionBudget, off unless pdb.enabled. */}}
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Values.appName }}
+spec:
+  {{- if hasKey .Values.pdb "minAvailable" }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: {{ .Values.appName }}
+{{- end }}

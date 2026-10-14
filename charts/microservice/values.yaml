@@ -11,3 +11,13 @@ containerEnvVars:
 
 servicePort: 8080
 serviceType: ClusterIP
+
+# --- Lab01 extension (not in upstream) ---------------------------------------
+# All empty/off by default, so the chart renders exactly like upstream unless
+# a release sets them.
+resources: {}        # requests/limits, rendered as-is
+startupProbe: {}     # probe specs, rendered as-is (httpGet, grpc, tcpSocket, exec)
+readinessProbe: {}
+livenessProbe: {}
+pdb:
+  enabled: false     # PodDisruptionBudget; set minAvailable or maxUnavailable
