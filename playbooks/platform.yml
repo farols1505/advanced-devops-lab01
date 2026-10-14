@@ -1,0 +1,75 @@
+---
+# Cluster add-ons, installed with Helm from Ansible:
+#   - Traefik, the Ingress controller (rubric: Ingress)
+#   - metrics-server, so `kubectl top` can measure what the pods really use
+#     before requests/limits are set (rubric: limits measured, not guessed)
+#   ansible-playbook playbooks/platform.yml
+
+- name: Install the cluster add-ons
+  hosts: control_plane
+  become: true
+  vars_files:
+    - ../vars/platform.yml
+
+  tasks:
+    - name: Add the Helm chart repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+      loop:
+        - { name: traefik, url: "{{ traefik_chart_repo }}" }
+        - { name: metrics-server, url: "{{ metrics_server_chart_repo }}" }
+
+    - name: Install Traefik as the default Ingress controller
+      kubernetes.core.helm:
+        name: traefik
+        chart_ref: traefik/traefik
+        chart_version: "{{ traefik_chart_version }}"
+        release_namespace: "{{ traefik_namespace }}"
+        create_namespace: true
+        values:
+          ingressClass:
+            enabled: true
+            isDefaultClass: true
+            name: "{{ ingress_class }}"
+          service:
+            spec:
+              type: NodePort
+          ports:
+            web:
+              nodePort: "{{ ingress_http_node_port }}"
+            websecure:
+              expose:
+                default: false        # plain HTTP only in this lab
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+
+    # Kubelets serve self-signed certificates (kubeadm default), so
+    # metrics-server cannot verify them; it reaches them on the InternalIP,
+    # which is the private-network address thanks to the --node-ip pin.
+    - name: Install metrics-server
+      kubernetes.core.helm:
+        name: metrics-server
+        chart_ref: metrics-server/metrics-server
+        chart_version: "{{ metrics_server_chart_version }}"
+        release_namespace: kube-system
+        values:
+          args:
+            - --kubelet-insecure-tls
+            - --kubelet-preferred-address-types=InternalIP
+
+    - name: Wait for Traefik and metrics-server to roll out
+      ansible.builtin.command: kubectl -n {{ item.namespace }} rollout status deployment/{{ item.name }} --timeout=300s
+      loop:
+        - { namespace: "{{ traefik_namespace }}", name: traefik }
+        - { namespace: kube-system, name: metrics-server }
+      changed_when: false
+
+    - name: Wait until the metrics API answers
+      ansible.builtin.command: kubectl top nodes
+      register: top_nodes
+      until: top_nodes.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: false

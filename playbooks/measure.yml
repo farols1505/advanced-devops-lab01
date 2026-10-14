@@ -1,0 +1,131 @@
+---
+# Part 5 (rubric: probes and limits): measure what each service really uses,
+# so requests/limits are measured, not guessed. Needs metrics-server
+# (playbooks/platform.yml). Run it with no limits applied, or with
+# generous ones, otherwise you measure the limit instead of the need.
+#   ansible-playbook playbooks/measure.yml | tee ../logs/measure.log
+#
+# Phase 1 (startup): restart every Deployment and sample while they start;
+#   JVM and Node.js services peak here.
+# Phase 2 (load): several shoppers browse, change currency, fill the cart
+#   and check out through the Ingress, while sampling continues.
+# Rule used (documented in the report):
+#   CPU request    = 1.25 x average under load   (CPU is compressible: a busy
+#                    pod can burst above its request up to the limit)
+#   memory request = 1.25 x peak under load      (memory is not: a pod needs
+#                    its peak, or it is evicted/OOM-killed)
+#   CPU limit      = 2 x highest value seen, at least 200m (startup bursts are
+#                    shorter than metrics-server's ~15 s resolution)
+#   memory limit   = 2 x highest value seen, at least 64Mi
+# The suggestions are per pod at the replica count measured. A Deployment
+# that later runs N replicas behind one Service splits the load: divide the
+# average by N for its CPU request (see frontend in vars/microservices.yml).
+
+- name: Measure CPU and memory of the Online Boutique
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/microservices.yml
+    - ../vars/platform.yml
+  vars:
+    startup_seconds: 120
+    load_seconds: 180
+    sample_every: 15
+    shoppers: 4
+
+  tasks:
+    - name: Restart the application and sample usage while it starts
+      ansible.builtin.shell: |
+        set -u
+        kubectl -n {{ app_namespace }} rollout restart deployment >/dev/null
+        end=$((SECONDS + {{ startup_seconds }}))
+        while [ $SECONDS -lt $end ]; do
+          kubectl -n {{ app_namespace }} top pods --no-headers 2>/dev/null | sed 's/^/startup /'
+          sleep {{ sample_every }}
+        done
+        kubectl -n {{ app_namespace }} wait deployment --all --for=condition=Available --timeout=300s >/dev/null
+      args:
+        executable: /bin/bash
+      register: startup_samples
+      changed_when: false
+
+    - name: Generate shopping traffic and sample usage under load
+      ansible.builtin.shell: |
+        set -u
+        url="http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ ingress_http_node_port }}"
+        host="Host: {{ storefront_host }}"
+        end=$((SECONDS + {{ load_seconds }}))
+        shopper() {
+          jar=$(mktemp)
+          c="curl -s -o /dev/null -m 20 -c $jar -b $jar -H"
+          while [ $SECONDS -lt $end ]; do
+            $c "$host" "$url/"
+            $c "$host" "$url/product/OLJCESPC7Z"
+            $c "$host" -d currency_code=EUR "$url/setCurrency"
+            $c "$host" -d product_id=OLJCESPC7Z -d quantity=2 "$url/cart"
+            $c "$host" "$url/cart"
+            $c "$host" -d currency_code=USD "$url/setCurrency"
+            $c "$host" -d email=someone@example.com -d "street_address=1600 Amphitheatre Parkway" \
+              -d zip_code=94043 -d "city=Mountain View" -d state=CA -d "country=United States" \
+              -d credit_card_number=4432801561520454 -d credit_card_expiration_month=1 \
+              -d credit_card_expiration_year=2030 -d credit_card_cvv=672 "$url/cart/checkout"
+          done
+          rm -f "$jar"
+        }
+        for i in $(seq {{ shoppers }}); do shopper & done
+        sleep {{ sample_every }}
+        while [ $SECONDS -lt $end ]; do
+          kubectl -n {{ app_namespace }} top pods --no-headers | sed 's/^/load /'
+          sleep {{ sample_every }}
+        done
+        wait
+      args:
+        executable: /bin/bash
+      register: load_samples
+      changed_when: false
+
+    # Lines look like: "<phase> <pod> <cpu>m <memory>Mi". The Deployment name
+    # is the pod name without its ReplicaSet hash and pod suffix.
+    - name: Find the peak of each Deployment in each phase
+      ansible.builtin.set_fact:
+        peaks: >-
+          {%- set p = {} -%}
+          {%- for line in startup_samples.stdout_lines + load_samples.stdout_lines -%}
+          {%- set f = line.split() -%}
+          {%- if f | length == 4 and f[2] is match('^[0-9]+m$') and f[3] is match('^[0-9]+Mi$') -%}
+          {%- set d = f[1] | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') -%}
+          {%- set cpu = f[2][:-1] | int -%}
+          {%- set mem = f[3][:-2] | int -%}
+          {%- set cur = p.get(d, {'startup_cpu': 0, 'startup_mem': 0, 'load_cpu': 0, 'load_mem': 0, 'load_cpu_sum': 0, 'load_n': 0, 'samples': 0}) -%}
+          {%- set _ = cur.update({f[0] ~ '_cpu': [cur[f[0] ~ '_cpu'], cpu] | max, f[0] ~ '_mem': [cur[f[0] ~ '_mem'], mem] | max, 'samples': cur.samples + 1}) -%}
+          {%- if f[0] == 'load' -%}
+          {%- set _ = cur.update({'load_cpu_sum': cur.load_cpu_sum + cpu, 'load_n': cur.load_n + 1}) -%}
+          {%- endif -%}
+          {%- set _ = p.update({d: cur}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ p }}
+
+    - name: Show the measurements and the requests/limits they suggest
+      ansible.builtin.debug:
+        msg: >-
+          {{ '%-22s %3s | %6s %6s | %6s %6s %6s || %6s %6s %6s %6s' | format(item.key, item.value.samples,
+             item.value.startup_cpu ~ 'm', item.value.startup_mem ~ 'Mi',
+             load_avg ~ 'm', item.value.load_cpu ~ 'm', item.value.load_mem ~ 'Mi',
+             cpu_req ~ 'm', mem_req ~ 'Mi', cpu_lim ~ 'm', mem_lim ~ 'Mi') }}
+      loop: "{{ peaks | dict2items | sort(attribute='key') }}"
+      loop_control:
+        label: "{{ item.key }}"
+      vars:
+        load_avg: "{{ (item.value.load_cpu_sum / [item.value.load_n, 1] | max) | round(0, 'ceil') | int }}"
+        peak_cpu: "{{ [item.value.startup_cpu, item.value.load_cpu] | max }}"
+        peak_mem: "{{ [item.value.startup_mem, item.value.load_mem] | max }}"
+        cpu_req: "{{ [10, ((load_avg | int * 1.25 / 5) | round(0, 'ceil') * 5) | int] | max }}"
+        mem_req: "{{ [32, ((item.value.load_mem | int * 1.25 / 8) | round(0, 'ceil') * 8) | int] | max }}"
+        cpu_lim: "{{ [200, ((peak_cpu | int * 2 / 50) | round(0, 'ceil') * 50) | int] | max }}"
+        mem_lim: "{{ [64, ((peak_mem | int * 2 / 16) | round(0, 'ceil') * 16) | int] | max }}"
+
+    - name: Column legend
+      ansible.builtin.debug:
+        msg: "deployment, samples | startup peak cpu, mem | load avg cpu, peak cpu, peak mem || suggested cpu request, memory request, cpu limit, memory limit"

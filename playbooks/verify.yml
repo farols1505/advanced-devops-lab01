@@ -3,16 +3,21 @@
 # any failure stops the play.
 #   ansible-playbook playbooks/verify.yml
 #
-# The expectations come from the project brief (Appendix A), not from
-# vars/microservices.yml, so a mistake in our own deploy vars is caught too.
+# The service names and ports come from the project brief (Appendix A), not
+# from vars/microservices.yml, so a mistake in our own deploy vars is caught
+# too. Only our own design choices (Ingress hostname and port) are read from
+# the vars files.
 
 - name: Verify the cluster and the Online Boutique
   hosts: control_plane
   become: true
   gather_facts: false
+  vars_files:
+    - ../vars/platform.yml
 
   vars:
     app_namespace: microservice
+    storefront_host: boutique.lab01.local
     # Appendix A: every Service and its port. In this chart the Deployment
     # has the same name as its Service.
     expected_services:
@@ -175,32 +180,129 @@
         target_name: "{{ item.value.split(':')[0] }}"
         target_port: "{{ item.value.split(':')[1] }}"
 
-    - name: The frontend Service is a NodePort
+    # --- Ingress -------------------------------------------------------------
+    # The frontend is internal again; the only way in is the Ingress.
+    - name: The frontend Service is a ClusterIP
       ansible.builtin.assert:
         that:
-          - frontend_svc.spec.type == 'NodePort'
-          - frontend_svc.spec.ports[0].nodePort is defined
-        fail_msg: "frontend is a {{ frontend_svc.spec.type }}, expected NodePort"
-        success_msg: "frontend is a NodePort on port {{ frontend_svc.spec.ports[0].nodePort }}"
+          - frontend_svc.spec.type == 'ClusterIP'
+        fail_msg: "frontend is a {{ frontend_svc.spec.type }}, expected ClusterIP (reachable only through the Ingress)"
+        success_msg: "frontend is a ClusterIP, not exposed on a node port"
       vars:
         frontend_svc: "{{ services.resources | selectattr('metadata.name', 'equalto', 'frontend') | first }}"
 
+    - name: Get the Ingress controller Deployment
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ traefik_namespace }}"
+        name: traefik
+      register: traefik_deployment
+
+    - name: The Ingress controller is running
+      ansible.builtin.assert:
+        that:
+          - traefik_deployment.resources | length == 1
+          - (traefik_deployment.resources[0].status.availableReplicas | default(0)) >= 1
+        fail_msg: "Traefik is not installed or has no available replica"
+        success_msg: "Traefik: {{ traefik_deployment.resources[0].status.availableReplicas }} available"
+
+    - name: Get the Ingresses
+      kubernetes.core.k8s_info:
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ app_namespace }}"
+      register: ingresses
+
+    - name: An Ingress routes the storefront hostname to frontend:80
+      ansible.builtin.assert:
+        that:
+          - routes | length > 0
+        fail_msg: "No Ingress rule sends {{ storefront_host }} to frontend:80 (class {{ ingress_class }})"
+        success_msg: "{{ routes | join(', ') }}: {{ storefront_host }}/ -> frontend:80"
+      vars:
+        routes: >-
+          {%- set out = [] -%}
+          {%- for ing in ingresses.resources if ing.spec.ingressClassName | default('') == ingress_class -%}
+          {%- for rule in ing.spec.rules | default([]) if rule.host | default('') == storefront_host -%}
+          {%- for p in rule.http.paths if p.backend.service.name == 'frontend' and p.backend.service.port.number == 80 -%}
+          {%- set _ = out.append(ing.metadata.name) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # --- Probes, requests/limits, PodDisruptionBudget -----------------------
+    - name: At least four services have liveness and readiness probes, each with requests and a memory limit
+      ansible.builtin.assert:
+        that:
+          - probed | length >= 4
+          - unsized | length == 0
+        fail_msg: "Probed: {{ probed }}; probed but without requests/memory limit: {{ unsized }}"
+        success_msg: "{{ probed | length }} services probed and sized: {{ probed | join(', ') }}"
+      vars:
+        containers: "{{ deployments.resources | map(attribute='spec.template.spec.containers') | map('first') | list }}"
+        probed: >-
+          {{ deployments.resources | zip(containers)
+             | selectattr('1.livenessProbe', 'defined') | selectattr('1.readinessProbe', 'defined')
+             | map(attribute='0.metadata.name') | list }}
+        unsized: >-
+          {{ deployments.resources | zip(containers)
+             | selectattr('1.livenessProbe', 'defined')
+             | rejectattr('1.resources.requests', 'defined')
+             | map(attribute='0.metadata.name') | list
+           + deployments.resources | zip(containers)
+             | selectattr('1.livenessProbe', 'defined')
+             | rejectattr('1.resources.limits.memory', 'defined')
+             | map(attribute='0.metadata.name') | list }}
+
+    - name: Get the PodDisruptionBudgets
+      kubernetes.core.k8s_info:
+        api_version: policy/v1
+        kind: PodDisruptionBudget
+        namespace: "{{ app_namespace }}"
+      register: pdbs
+
+    # minAvailable must be below the replica count, otherwise the budget
+    # allows 0 disruptions and every drain of the node is refused.
+    - name: The frontend PDB allows one pod at a time to be evicted
+      ansible.builtin.assert:
+        that:
+          - frontend_pdb | length == 1
+          - frontend_pdb[0].status.disruptionsAllowed | default(0) >= 1
+        fail_msg: "frontend PDB missing or allowing 0 disruptions (minAvailable >= replicas?)"
+        success_msg: >-
+          frontend: {{ frontend_pdb[0].status.currentHealthy }} healthy,
+          minAvailable {{ frontend_pdb[0].spec.minAvailable }},
+          {{ frontend_pdb[0].status.disruptionsAllowed }} disruption(s) allowed
+      vars:
+        frontend_pdb: "{{ pdbs.resources | selectattr('metadata.name', 'equalto', 'frontend') | list }}"
+
     - name: Remember the storefront URL
       ansible.builtin.set_fact:
-        frontend_node_port: "{{ (services.resources | selectattr('metadata.name', 'equalto', 'frontend') | first).spec.ports[0].nodePort }}"
-        storefront_url: "http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ (services.resources | selectattr('metadata.name', 'equalto', 'frontend') | first).spec.ports[0].nodePort }}/"
+        storefront_url: "http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ ingress_http_node_port }}/"
 
-    # --- HTTP ----------------------------------------------------------------
-    # A NodePort is published on every node. Going through the master also
-    # crosses the Flannel tunnel to the frontend pod on node1.
-    - name: The storefront returns 200 with recognisable content on every node
+    # --- HTTP (through the Ingress) -------------------------------------------
+    # Traefik's NodePort is published on every node. Going through the master
+    # also crosses the Flannel tunnel to the Traefik pod on node1.
+    - name: The storefront hostname returns 200 with recognisable content on every node
       ansible.builtin.uri:
-        url: "http://{{ hostvars[item]['ansible_host'] }}:{{ frontend_node_port }}/"
+        url: "http://{{ hostvars[item]['ansible_host'] }}:{{ ingress_http_node_port }}/"
+        headers:
+          Host: "{{ storefront_host }}"
         return_content: true
         timeout: 30
       register: storefront
       failed_when: storefront.status != 200 or 'Online Boutique' not in storefront.content
       loop: "{{ groups['k8s'] }}"
+
+    # Proves the routing is by hostname, not "everything goes to the frontend".
+    - name: Any other hostname gets 404 from the Ingress controller
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}"
+        headers:
+          Host: "not-the-storefront.{{ storefront_host }}"
+        status_code: 404
+        timeout: 30
 
     # A real purchase: frontend -> cart (redis) -> checkout -> payment,
     # shipping, email, currency, productcatalog. This is the path the
@@ -208,6 +310,8 @@
     - name: Open a shopping session
       ansible.builtin.uri:
         url: "{{ storefront_url }}"
+        headers:
+          Host: "{{ storefront_host }}"
         timeout: 30
       register: session
 
@@ -220,6 +324,7 @@
           product_id: "{{ test_product_id }}"
           quantity: 1
         headers:
+          Host: "{{ storefront_host }}"
           Cookie: "{{ session.cookies_string }}"
         follow_redirects: none
         status_code: 302
@@ -236,6 +341,7 @@
         body_format: form-urlencoded
         body: "{{ test_order }}"
         headers:
+          Host: "{{ storefront_host }}"
           Cookie: "{{ session.cookies_string }}"
         return_content: true
         status_code: [200, 500]
@@ -259,4 +365,4 @@
       ansible.builtin.debug:
         msg:
           - "All checks passed."
-          - "Storefront: {{ storefront_url }}"
+          - "Storefront: http://{{ storefront_host }}:{{ ingress_http_node_port }}/ (add \"{{ hostvars[groups['workers'][0]]['ansible_host'] }} {{ storefront_host }}\" to /etc/hosts)"

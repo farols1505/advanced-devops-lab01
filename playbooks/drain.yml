@@ -1,0 +1,114 @@
+---
+# Part 5 (rubric: scaling - drain performed and explained). Drains or
+# uncordons a node through Ansible, and shows the PodDisruptionBudgets and
+# where the pods end up.
+#   ansible-playbook playbooks/drain.yml -e node=master                  # drain
+#   ansible-playbook playbooks/drain.yml -e node=master -e action=uncordon
+#   ansible-playbook playbooks/drain.yml -e node=node1                   # blocked by the frontend PDB
+#
+# Drain = cordon (no new pods) + evict every pod except DaemonSet pods and
+# mirror (static) pods. Evictions go through the Eviction API, which honours
+# PodDisruptionBudgets: an eviction that would leave a PDB below its minimum
+# is refused (HTTP 429). kubernetes.core.k8s_drain evicts the pods one after
+# another and stops at the first 429 WITHOUT uncordoning: the pods evicted
+# before it are gone and cannot come back while the node is cordoned. The
+# rescue below records that state, then uncordons and waits for recovery.
+
+- name: Drain or uncordon a node
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars:
+    node: node1
+    action: drain                  # drain | uncordon
+    app_namespace: microservice
+
+  tasks:
+    - name: The node and the action are valid
+      ansible.builtin.assert:
+        that:
+          - node in groups['k8s']
+          - action in ['drain', 'uncordon']
+        quiet: true
+
+    - name: Show the PodDisruptionBudgets before
+      ansible.builtin.command: kubectl get pdb -A
+      register: pdb_before
+      changed_when: false
+
+    - name: Drain {{ node }}
+      when: action == 'drain'
+      block:
+        - name: Drain {{ node }} (evict through the Eviction API)
+          kubernetes.core.k8s_drain:
+            name: "{{ node }}"
+            state: drain
+            delete_options:
+              ignore_daemonsets: true      # flannel, kube-proxy run on every node by design
+              delete_emptydir_data: true   # redis-cart keeps the cart in an emptyDir: it is lost
+              wait_timeout: 180
+          register: drain_result
+      rescue:
+        - name: Remember that the drain was refused
+          ansible.builtin.set_fact:
+            drain_refused: "{{ ansible_failed_result.msg | default('drain failed') }}"
+
+        - name: Get the state while {{ node }} is still cordoned
+          ansible.builtin.command: "{{ item }}"
+          loop:
+            - kubectl get nodes
+            - kubectl get pdb -A
+            - kubectl get pods -A -o wide --field-selector=status.phase=Pending
+          register: state_refused
+          changed_when: false
+
+        - name: Show the state while {{ node }} is still cordoned
+          ansible.builtin.debug:
+            msg: "{{ state_refused.results | map(attribute='stdout_lines') | list }}"
+
+        - name: Uncordon {{ node }} (the module leaves it cordoned)
+          kubernetes.core.k8s_drain:
+            name: "{{ node }}"
+            state: uncordon
+
+        # Not `rollout status`: right after the evictions the Deployments may
+        # not have noticed yet and still report every replica available.
+        - name: Wait until every pod is Running and Ready again
+          ansible.builtin.shell: >-
+            set -o pipefail;
+            kubectl get pods -A --no-headers
+            | awk '{split($3, r, "/"); if (r[1] != r[2] || $4 != "Running") print $1 "/" $2 " " $3 " " $4}'
+          args:
+            executable: /bin/bash
+          register: not_ready
+          until: not_ready.stdout == ""
+          retries: 60
+          delay: 5
+          changed_when: false
+
+    - name: Uncordon {{ node }}
+      kubernetes.core.k8s_drain:
+        name: "{{ node }}"
+        state: uncordon
+      when: action == 'uncordon'
+
+    - name: Get the state after
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - kubectl get nodes
+        - kubectl get pdb -A
+        - kubectl get pods -A -o wide --sort-by=.spec.nodeName
+      register: state_after
+      changed_when: false
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg:
+          - "PDBs before: {{ pdb_before.stdout_lines }}"
+          - "Drain result: {{ drain_result.result | default(drain_refused | default('-')) }}"
+          - "{{ state_after.results | map(attribute='stdout_lines') | list }}"
+
+    - name: Fail if the drain was refused
+      ansible.builtin.fail:
+        msg: "Drain of {{ node }} refused: {{ drain_refused }}"
+      when: drain_refused is defined

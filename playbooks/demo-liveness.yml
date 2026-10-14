@@ -1,0 +1,87 @@
+---
+# Part 5 (rubric: probes - restart demonstrated). Freezes the main process of
+# one service with SIGSTOP on the node that runs it. Nothing crashes and no
+# configuration changes: the process simply stops answering, like a hung
+# server. The readiness probe takes the pod out of its Service, then the
+# liveness probe fails and the kubelet restarts the container.
+#   ansible-playbook playbooks/demo-liveness.yml                     # productcatalogservice
+#   ansible-playbook playbooks/demo-liveness.yml -e target=currencyservice
+
+- name: Find the pod to freeze
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars:
+    app_namespace: microservice
+    target: productcatalogservice
+  tasks:
+    - name: Get the target pod
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ app_namespace }}"
+        label_selectors: ["app={{ target }}"]
+      register: target_pods
+
+    - name: Remember the pod, its node, container and restart count
+      ansible.builtin.set_fact:
+        demo_pod: "{{ pod.metadata.name }}"
+        demo_node: "{{ pod.spec.nodeName }}"
+        demo_container_id: "{{ pod.status.containerStatuses[0].containerID | regex_replace('^containerd://', '') }}"
+        demo_restarts_before: "{{ pod.status.containerStatuses[0].restartCount }}"
+        demo_liveness: "{{ pod.spec.containers[0].livenessProbe | default({}) }}"
+      vars:
+        pod: "{{ target_pods.resources | selectattr('status.phase', 'equalto', 'Running') | first }}"
+
+    - name: The target has a liveness probe
+      ansible.builtin.assert:
+        that:
+          - demo_liveness | length > 0
+        fail_msg: "{{ target }} has no livenessProbe: nothing would restart it"
+        success_msg: "{{ demo_pod }} on {{ demo_node }}, restarts={{ demo_restarts_before }}, livenessProbe={{ demo_liveness | to_json }}"
+
+    # Runs on the node that hosts the pod. `ctr` ships with containerd
+    # (crictl is not installed); Kubernetes containers live in the k8s.io
+    # namespace, and the task list gives each container's host PID.
+    - name: Find the process ID of the container on {{ demo_node }}
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        ctr -n k8s.io tasks ls | awk '$1 == "{{ demo_container_id }}" {print $2}'
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ demo_node }}"
+      register: demo_pid
+      changed_when: false
+
+    - name: Send SIGSTOP (the process is frozen, not killed)
+      ansible.builtin.command: kill -STOP {{ demo_pid.stdout }}
+      delegate_to: "{{ demo_node }}"
+      changed_when: true
+
+    - name: Wait for the restart count to go up
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ app_namespace }}"
+        name: "{{ demo_pod }}"
+      register: demo_after
+      until: demo_after.resources[0].status.containerStatuses[0].restartCount > demo_restarts_before | int
+      retries: 36
+      delay: 5
+
+    - name: Get the events of the pod
+      ansible.builtin.command: >-
+        kubectl -n {{ app_namespace }} get events
+        --field-selector involvedObject.name={{ demo_pod }}
+        --sort-by=.lastTimestamp
+        -o custom-columns=LAST:.lastTimestamp,REASON:.reason,MESSAGE:.message
+      register: demo_events
+      changed_when: false
+
+    - name: Show what happened
+      ansible.builtin.debug:
+        msg:
+          - "{{ demo_pod }}: restarts {{ demo_restarts_before }} -> {{ demo_after.resources[0].status.containerStatuses[0].restartCount }}"
+          - "{{ demo_events.stdout_lines }}"
+
+    - name: Wait until the restarted container is Ready again
+      ansible.builtin.command: kubectl -n {{ app_namespace }} wait pod/{{ demo_pod }} --for=condition=Ready --timeout=180s
+      changed_when: false

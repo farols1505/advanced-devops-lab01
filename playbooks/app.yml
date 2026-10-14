@@ -8,6 +8,7 @@
   become: true
   vars_files:
     - ../vars/microservices.yml
+    - ../vars/platform.yml
 
   tasks:
     # Without helm-diff, kubernetes.core.helm compares the release's values
@@ -25,15 +26,30 @@
         dest: "{{ src }}"
         version: "{{ microservice_repo_version }}"
 
+    - name: Copy the vendored charts to the control plane
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../charts/"
+        dest: "{{ vendored_charts }}/"
+        mode: u=rwX,go=rX
+
+    # redis-cart keeps the cart in an emptyDir: a second replica would have
+    # its own empty copy behind the same Service (cart "randomly" empties).
+    - name: Refuse to scale redis-cart
+      ansible.builtin.assert:
+        that:
+          - (replicas.rediscart | default(1)) | int == 1
+        fail_msg: "redis-cart must stay at 1 replica: each replica has its own emptyDir"
+        quiet: true
+
     - name: Deploy each microservice as a Helm release
       kubernetes.core.helm:
         name: "{{ item.name }}"
-        chart_ref: "{{ src }}/{{ item.chart }}"
+        chart_ref: "{{ item.chart }}"
         release_namespace: "{{ app_namespace }}"
         create_namespace: true
         values_files:
           - "{{ src }}/{{ item.values_file }}"    # upstream file, unchanged
-        values: "{{ common | combine(item.overrides | default({})) }}"  # ours, applied last
+        values: "{{ common | combine(item.overrides | default({}), tuning[item.name] | default({}), replica_count) }}"  # ours, applied last
         # helm-diff compares the chart with the release record, not with the
         # live cluster, so a resource deleted by hand goes unnoticed (ok,
         # changed=0). -e app_force_upgrade=true runs `helm upgrade --force` for
@@ -42,21 +58,48 @@
       loop: "{{ microservices }}"
       loop_control:
         label: "{{ item.name }}"
+      vars:
+        replica_count: "{{ {'appReplicas': replicas[item.name]} if item.name in replicas else {} }}"
 
-    - name: Wait for every Deployment to become Available
-      ansible.builtin.command: >-
-        kubectl -n {{ app_namespace }} wait deployment --all
-        --for=condition=Available --timeout=600s
+    # `rollout status`, not `wait --for=condition=Available`: during a rolling
+    # update the old pods keep a Deployment Available, so the latter returns
+    # before the new pods (new probes/limits) are running.
+    - name: Wait for every Deployment to finish rolling out
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        kubectl -n {{ app_namespace }} get deployment -o name
+        | xargs -n1 kubectl -n {{ app_namespace }} rollout status --timeout=600s
+      args:
+        executable: /bin/bash
       changed_when: false
 
-    - name: Read the frontend NodePort
-      ansible.builtin.command: >-
-        kubectl -n {{ app_namespace }} get service frontend
-        -o jsonpath={.spec.ports[0].nodePort}
-      register: frontend_node_port
-      changed_when: false
+    # Host-based routing: only requests for storefront_host reach the
+    # frontend; Traefik answers anything else with 404.
+    - name: Route the storefront hostname to the frontend
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: storefront
+            namespace: "{{ app_namespace }}"
+          spec:
+            ingressClassName: "{{ ingress_class }}"
+            rules:
+              - host: "{{ storefront_host }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: frontend
+                          port:
+                            number: 80
 
-    # A NodePort is published on every node; node1 is where the pods run.
+    # Traefik's NodePort is published on every node. The host machine needs
+    # "192.168.56.11 {{ storefront_host }}" in /etc/hosts to use the name.
     - name: Show the storefront URL
       ansible.builtin.debug:
-        msg: "Storefront: http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ frontend_node_port.stdout }}/"
+        msg: "Storefront: http://{{ storefront_host }}:{{ ingress_http_node_port }}/"

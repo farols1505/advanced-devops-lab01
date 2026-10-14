@@ -10,8 +10,16 @@ microservice_repo: https://github.com/iankisali/microservice-deployment.git
 # Pinned commit, so a rebuild deploys exactly what was tested.
 microservice_repo_version: 8ed96c8d98625c73b67c7172b6703383ea9e46e9
 src: /opt/microservice-deployment
+# Our vendored, extended copy of chart/microservice (repo: charts/), copied to
+# the master because Helm runs there. The values files still come from the
+# pinned clone, unchanged.
+vendored_charts: /opt/lab01-charts
 
 app_namespace: microservice
+
+# Hostname the Ingress routes to the frontend. Requests reach Traefik on
+# http://<any node>:{{ ingress_http_node_port }}/ and are routed by Host header.
+storefront_host: boutique.lab01.local
 
 # helm-diff gives kubernetes.core.helm an accurate idempotency check.
 helm_diff_version: v3.15.15
@@ -28,34 +36,34 @@ fix_checkout_bug: true
 
 microservices:
   - name: rediscart
-    chart: chart/redis
+    chart: "{{ src }}/chart/redis"          # upstream, from the clone
     values_file: values/redis-values.yaml
   - name: emailservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/email-service-values.yaml
   - name: cartservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/cart-service-values.yaml
   - name: currencyservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/currency-service-values.yaml
   - name: paymentservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/payment-service-values.yaml
   - name: recommendationservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/recommendation-service-values.yaml
   - name: productcatalogservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/productcatalog-service-values.yaml
   - name: shippingservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/shipping-service-values.yaml
   - name: adservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/ad-service-values.yaml
   - name: checkoutservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/checkout-service-values.yaml
     # Upstream bug: the file says `appImage: checkoutservice` where it means
     # appName. The duplicate key loses, appName is never set and the chart
@@ -63,9 +71,90 @@ microservices:
     # frontend calls checkoutservice:5050.
     overrides: "{{ {'appName': 'checkoutservice'} if fix_checkout_bug | bool else {} }}"
   - name: frontendservice
-    chart: chart/microservice
+    chart: "{{ vendored_charts }}/microservice"
     values_file: values/frontend-values.yaml
     # Upstream asks for a LoadBalancer. Nothing provisions one on bare-metal
-    # kubeadm, so it would stay <pending> forever.
+    # kubeadm, so it would stay <pending> forever. Parts 3-4 used a NodePort;
+    # now the Traefik Ingress is the only way in, so the frontend is an
+    # internal ClusterIP like the other ten.
     overrides:
-      serviceType: NodePort
+      serviceType: ClusterIP
+
+# --- Scaling (rubric: scaling done through Ansible) --------------------------
+# Replica count per release, on top of common.appReplicas. Change it here (or
+# with -e '{"replicas": {"frontendservice": 3}}') and re-run app.yml.
+# frontend runs 2 so that its PodDisruptionBudget (minAvailable: 1) still
+# allows one voluntary disruption at a time. redis-cart must stay at 1.
+replicas:
+  frontendservice: 2
+
+# --- Probes, requests/limits, PDB (rubric: probes and limits) ----------------
+# Rendered by our vendored chart (charts/microservice). Numbers come from
+# playbooks/measure.yml (2 min startup + 3 min load with 4 shoppers,
+# 20 samples, 2026-10-14):
+#   CPU request    = 1.25 x average under load
+#   memory request = 1.25 x peak under load
+#   CPU limit      = 2 x highest seen (min 200m); memory limit = 2 x highest (min 64Mi)
+# Probes: the nine gRPC services implement grpc.health.v1 (checked with
+# grpc_health_probe: SERVING), so they use the kubelet's native gRPC probe;
+# the frontend serves /_healthz. startupProbe gives slow starters (the JVM
+# in adservice) time before liveness starts counting.
+tuning:
+  frontendservice:
+    # Measured with 1 replica (225m average for the whole shop). It runs 2
+    # behind one Service, so each pod carries about half: 1.25 x 225/2 = 145m.
+    # The limit stays at 2 x the single-pod peak: while one replica is being
+    # evicted (drain), the other carries all the traffic. At 285m per pod
+    # node1 (2 CPU) ran out of requestable CPU: a third replica stayed
+    # Pending and CoreDNS could not move there when the master was drained.
+    resources: { requests: { cpu: 145m, memory: 32Mi }, limits: { cpu: 550m, memory: 64Mi } }
+    startupProbe: { httpGet: { path: /_healthz, port: 8080, httpHeaders: [{ name: Cookie, value: shop_session-id=x-readiness-probe }] }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { httpGet: { path: /_healthz, port: 8080, httpHeaders: [{ name: Cookie, value: shop_session-id=x-readiness-probe }] }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { httpGet: { path: /_healthz, port: 8080, httpHeaders: [{ name: Cookie, value: shop_session-id=x-liveness-probe }] }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    pdb: { enabled: true, minAvailable: 1 }
+  productcatalogservice:
+    resources: { requests: { cpu: 120m, memory: 32Mi }, limits: { cpu: 250m, memory: 64Mi } }
+    startupProbe: { grpc: { port: 3550 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 3550 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 3550 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  currencyservice:
+    resources: { requests: { cpu: 185m, memory: 72Mi }, limits: { cpu: 400m, memory: 144Mi } }
+    startupProbe: { grpc: { port: 7000 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 7000 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 7000 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  cartservice:
+    resources: { requests: { cpu: 155m, memory: 56Mi }, limits: { cpu: 300m, memory: 96Mi } }
+    startupProbe: { grpc: { port: 7070 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 7070 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 7070 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  recommendationservice:
+    resources: { requests: { cpu: 115m, memory: 48Mi }, limits: { cpu: 250m, memory: 80Mi } }
+    startupProbe: { grpc: { port: 8080 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 8080 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 8080 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  shippingservice:
+    resources: { requests: { cpu: 50m, memory: 32Mi }, limits: { cpu: 200m, memory: 64Mi } }
+    startupProbe: { grpc: { port: 50051 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 50051 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 50051 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  checkoutservice:
+    resources: { requests: { cpu: 240m, memory: 32Mi }, limits: { cpu: 500m, memory: 64Mi } }
+    startupProbe: { grpc: { port: 5050 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 5050 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 5050 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  adservice:
+    # JVM: slowest to start, so the startupProbe allows 5 minutes.
+    resources: { requests: { cpu: 85m, memory: 144Mi }, limits: { cpu: 350m, memory: 224Mi } }
+    startupProbe: { grpc: { port: 9555 }, periodSeconds: 5, failureThreshold: 60 }
+    readinessProbe: { grpc: { port: 9555 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 9555 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  paymentservice:
+    resources: { requests: { cpu: 25m, memory: 32Mi }, limits: { cpu: 200m, memory: 64Mi } }
+    startupProbe: { grpc: { port: 50051 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 50051 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 50051 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+  emailservice:
+    resources: { requests: { cpu: 35m, memory: 48Mi }, limits: { cpu: 200m, memory: 80Mi } }
+    startupProbe: { grpc: { port: 8080 }, periodSeconds: 5, failureThreshold: 24 }
+    readinessProbe: { grpc: { port: 8080 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }
+    livenessProbe: { grpc: { port: 8080 }, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3 }

@@ -1,0 +1,17 @@
+---
+# Cluster add-ons installed by playbooks/platform.yml (Helm, from Ansible).
+
+# --- Ingress controller: Traefik ---
+# ingress-nginx was retired by Kubernetes SIG Network in March 2026; Traefik
+# is maintained and implements the standard Ingress API.
+traefik_chart_repo: https://traefik.github.io/charts
+traefik_chart_version: 41.6.1          # Traefik v3.7.13
+traefik_namespace: traefik
+# No cloud load balancer on bare-metal kubeadm, so the controller is exposed
+# on a fixed NodePort on every node instead.
+ingress_http_node_port: 30080
+ingress_class: traefik
+
+# --- metrics-server (kubectl top; used to measure requests/limits) ---
+metrics_server_chart_repo: https://kubernetes-sigs.github.io/metrics-server/
+metrics_server_chart_version: 3.13.1   # metrics-server 0.8.1
